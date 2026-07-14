@@ -89,32 +89,46 @@ class AdyApiClient:
             "X-XSRF-TOKEN": unquote(xsrf_token),
         }
 
+    def _wait_for_search_page(self, page) -> None:
+        """Wait until Cloudflare passes and reCAPTCHA is ready.
+
+        Do NOT wait for networkidle — ADY + analytics never go idle and that
+        alone causes 90s timeouts on a VPS.
+        """
+        page.wait_for_function(
+            "() => document.title.indexOf('Just a moment') === -1",
+            timeout=120_000,
+        )
+        # Title can clear before scripts finish; give the ticket app a moment.
+        time.sleep(3)
+        page.wait_for_function(
+            "() => typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function'",
+            timeout=90_000,
+        )
+        time.sleep(1)
+
     def _extract_g_token_from_page(self, page) -> tuple[str, list]:
         """Extract g_token and page cookies from a ready page. Returns (token, cookies)."""
-        # Allow reCAPTCHA and any late redirects to settle (keep short on low-RAM VPS).
-        time.sleep(2)
-
         token = page.evaluate(
             f"""
             () => new Promise((resolve, reject) => {{
+                const timer = setTimeout(() => reject(new Error('grecaptcha.execute timeout')), 45000);
                 grecaptcha.ready(() => {{
                     grecaptcha
                         .execute('{config.RECAPTCHA_SITE_KEY}', {{ action: 'ticket_api' }})
                         .then(t => {{
+                            clearTimeout(timer);
                             window._g_token = t;
                             resolve(t);
                         }})
-                        .catch(reject);
+                        .catch(err => {{
+                            clearTimeout(timer);
+                            reject(err);
+                        }});
                 }});
             }})
             """
         )
-
-        if token:
-            verify_token = page.evaluate("() => window._g_token")
-            if verify_token != token:
-                logger.warning("Token mismatch detected, using window value")
-                token = verify_token
 
         if not token or not isinstance(token, str):
             raise AdyApiError("Received an empty g_token from reCAPTCHA")
@@ -128,7 +142,7 @@ class AdyApiClient:
         Execute Google reCAPTCHA v3 in a headless browser context with retry logic.
 
         Returns (g_token, cookies). Playwright resources are always closed in finally
-        to avoid OOM on small VPS.
+        to avoid OOM on small VPS. Each retry launches a fresh browser (no hard-refresh).
         """
         max_retries = 2
         for attempt in range(max_retries):
@@ -137,6 +151,10 @@ class AdyApiClient:
             context = None
             page = None
             try:
+                if attempt > 0:
+                    logger.info("Retrying g_token with a fresh browser (attempt %d)", attempt + 1)
+                    time.sleep(2)
+
                 playwright = sync_playwright().start()
                 browser = playwright.chromium.launch(
                     headless=True,
@@ -149,39 +167,18 @@ class AdyApiClient:
                 )
 
                 page = context.new_page()
-                page.on("close", lambda: logger.debug("Page closed"))
-
                 page.goto(
                     config.ADY_SEARCH_PAGE,
                     wait_until="domcontentloaded",
                     timeout=120_000,
                 )
-                page.wait_for_load_state("networkidle", timeout=90_000)
-                page.wait_for_function(
-                    "() => document.title.indexOf('Just a moment') === -1",
-                    timeout=90_000,
-                )
-                page.wait_for_function(
-                    "() => typeof grecaptcha !== 'undefined' && !!grecaptcha.execute",
-                    timeout=60_000,
-                )
+                # Optional: wait for load, but don't fail if analytics keep connecting.
+                try:
+                    page.wait_for_load_state("load", timeout=30_000)
+                except PlaywrightTimeoutError:
+                    logger.debug("load state timeout ignored")
 
-                if attempt > 0:
-                    logger.info(
-                        "Hard-refreshing page after g_token extraction failure (attempt %d)",
-                        attempt + 1,
-                    )
-                    page.keyboard.press("Control+Shift+R")
-                    page.wait_for_load_state("networkidle", timeout=90_000)
-                    page.wait_for_function(
-                        "() => document.title.indexOf('Just a moment') === -1",
-                        timeout=90_000,
-                    )
-                    page.wait_for_function(
-                        "() => typeof grecaptcha !== 'undefined' && !!grecaptcha.execute",
-                        timeout=60_000,
-                    )
-
+                self._wait_for_search_page(page)
                 return self._extract_g_token_from_page(page)
             except (PlaywrightTimeoutError, AdyApiError) as exc:
                 if attempt < max_retries - 1:
