@@ -91,8 +91,8 @@ class AdyApiClient:
 
     def _extract_g_token_from_page(self, page) -> tuple[str, list]:
         """Extract g_token and page cookies from a ready page. Returns (token, cookies)."""
-        # Allow reCAPTCHA and any late redirects to settle.
-        time.sleep(10)
+        # Allow reCAPTCHA and any late redirects to settle (keep short on low-RAM VPS).
+        time.sleep(2)
 
         token = page.evaluate(
             f"""
