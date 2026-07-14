@@ -45,15 +45,11 @@ def log_found_tickets(trips: list[AvailableTrip]) -> None:
 
 
 def is_target_trip(trip: AvailableTrip) -> bool:
-    """Return True when trip's minimum price is strictly less than 115 AZN.
-
-    Date is not considered.
-    """
+    """Return True when trip's minimum price is strictly less than 115 AZN."""
     try:
         min_amount = float(trip.min_amount)
     except (TypeError, ValueError):
         return False
-
     return min_amount < 115.0
 
 
@@ -104,9 +100,7 @@ def check_tickets(
 
 
 def run_once() -> None:
-    """Run a single availability check (used by GitHub Actions / cron)."""
     validate_config()
-
     api_client = AdyApiClient()
     storage = NotifiedDatesStorage()
     notifier = TelegramNotifier()
@@ -118,7 +112,6 @@ def run_once() -> None:
 
 def run_forever() -> None:
     validate_config()
-
     logger.info(
         "Starting ADY monitor: %s → %s (every %s seconds)",
         config.FROM_STATION_NAME,
@@ -127,7 +120,6 @@ def run_forever() -> None:
     )
 
     def scheduled_check() -> None:
-        # Fresh client each run so Playwright/session objects are not retained.
         api_client = AdyApiClient()
         storage = NotifiedDatesStorage()
         notifier = TelegramNotifier()
@@ -152,7 +144,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Run one check and exit (for GitHub Actions / cron)",
+        help="Run one check and exit (for cron)",
     )
     return parser.parse_args()
 

@@ -1,15 +1,20 @@
-"""Client for the ADY ticket API (ticket.ady.az)."""
+"""Client for the ADY ticket API (ticket.ady.az).
+
+Working approach (verified earlier locally):
+  1) curl_cffi (Safari TLS) bootstraps CF/XSRF cookies
+  2) Those cookies are seeded into Playwright
+  3) Playwright only runs grecaptcha.execute for g_token
+  4) API call uses curl_cffi session + g_token
+"""
 
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from urllib.parse import unquote
 
-import requests
 from curl_cffi import requests as cffi_requests
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -23,17 +28,12 @@ SAFARI_USER_AGENT = (
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 )
 
-# Do NOT use --single-process or --disable-web-resources — they break reCAPTCHA.
+# Minimal flags — keep close to the original working Mac version.
+# Avoid --single-process and --disable-web-resources (break reCAPTCHA).
 CHROMIUM_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--no-sandbox",
     "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--disable-extensions",
-    "--mute-audio",
-    "--no-first-run",
-    "--disable-default-apps",
-    "--js-flags=--max-old-space-size=192",
 ]
 
 
@@ -49,38 +49,23 @@ class AdyApiError(Exception):
 
 
 class AdyApiClient:
-    """
-    Talks to ADY using curl_cffi for HTTP (Cloudflare-safe) and Playwright /
-    optional CAPTCHA API for reCAPTCHA v3 g_token.
-    """
-
     def __init__(self) -> None:
         self.session = cffi_requests.Session(impersonate="safari17_0")
 
     def _bootstrap_session(self) -> None:
-        """Load the search page with curl_cffi to obtain CF/XSRF cookies."""
+        """Load the search page to obtain Cloudflare + XSRF cookies."""
         response = self.session.get(
             config.ADY_SEARCH_PAGE,
             timeout=60,
             headers={"User-Agent": SAFARI_USER_AGENT},
         )
         response.raise_for_status()
+
+        # Accept page if it looks like the real ticket app (CF can appear in HTML comments).
         if "Just a moment" in response.text and "Purchase train tickets" not in response.text:
             raise AdyApiError("Cloudflare challenge page received during session bootstrap")
-        logger.debug("Session cookies: %s", list(self.session.cookies.keys()))
 
-    def _transfer_browser_cookies_to_session(self, browser_cookies: list) -> None:
-        for cookie_data in browser_cookies:
-            self.session.cookies.set(
-                cookie_data["name"],
-                cookie_data["value"],
-                domain=cookie_data.get("domain", ""),
-                path=cookie_data.get("path", "/"),
-            )
-        logger.debug(
-            "Transferred cookies from browser: %s",
-            [c["name"] for c in browser_cookies],
-        )
+        logger.info("Bootstrapped ADY session; cookies=%s", list(self.session.cookies.keys()))
 
     def _build_api_headers(self) -> Dict[str, str]:
         xsrf_token = self.session.cookies.get("XSRF-TOKEN")
@@ -97,161 +82,81 @@ class AdyApiClient:
             "X-XSRF-TOKEN": unquote(xsrf_token),
         }
 
-    def _solve_g_token_via_2captcha(self) -> str:
-        """Solve reCAPTCHA v3 via 2Captcha when CAPTCHA_API_KEY is set."""
-        api_key = os.getenv("CAPTCHA_API_KEY", "").strip()
-        if not api_key:
-            raise AdyApiError("CAPTCHA_API_KEY is not set")
+    def obtain_g_token(self) -> str:
+        """
+        Execute Google reCAPTCHA v3 using Playwright with curl_cffi cookies seeded in.
 
-        create = requests.post(
-            "https://api.2captcha.com/createTask",
-            json={
-                "clientKey": api_key,
-                "task": {
-                    "type": "RecaptchaV3TaskProxyless",
-                    "websiteURL": config.ADY_SEARCH_PAGE,
-                    "websiteKey": config.RECAPTCHA_SITE_KEY,
-                    "minScore": 0.3,
-                    "pageAction": "ticket_api",
-                    "isEnterprise": False,
-                },
-            },
-            timeout=60,
-        )
-        create.raise_for_status()
-        created = create.json()
-        if created.get("errorId"):
-            raise AdyApiError(f"2Captcha createTask error: {created}")
+        Always closes Playwright resources in finally (OOM protection on VPS).
+        """
+        cookie_seed = [
+            {
+                "name": name,
+                "value": value,
+                "domain": ".ady.az",
+                "path": "/",
+            }
+            for name, value in self.session.cookies.items()
+        ]
 
-        task_id = created["taskId"]
-        logger.info("2Captcha task created: %s", task_id)
-
-        for _ in range(40):
-            time.sleep(5)
-            poll = requests.post(
-                "https://api.2captcha.com/getTaskResult",
-                json={"clientKey": api_key, "taskId": task_id},
-                timeout=60,
-            )
-            poll.raise_for_status()
-            result = poll.json()
-            if result.get("errorId"):
-                raise AdyApiError(f"2Captcha getTaskResult error: {result}")
-            if result.get("status") == "ready":
-                token = result["solution"]["gRecaptchaResponse"]
-                logger.info("2Captcha solved g_token (%d chars)", len(token))
-                return token
-            logger.debug("2Captcha still processing...")
-
-        raise AdyApiError("2Captcha timed out waiting for solution")
-
-    def _wait_for_search_page(self, page) -> None:
-        page.wait_for_function(
-            "() => document.title.indexOf('Just a moment') === -1",
-            timeout=120_000,
-        )
-        time.sleep(2)
-        page.wait_for_function(
-            """
-            () => typeof grecaptcha !== 'undefined'
-              && typeof grecaptcha.execute === 'function'
-              && typeof grecaptcha.ready === 'function'
-            """,
-            timeout=90_000,
-        )
-        # Wait until reCAPTCHA internal client registry is populated.
-        try:
-            page.wait_for_function(
-                """
-                () => !!(window.___grecaptcha_cfg
-                  && window.___grecaptcha_cfg.clients
-                  && Object.keys(window.___grecaptcha_cfg.clients).length > 0)
-                """,
-                timeout=30_000,
-            )
-        except PlaywrightTimeoutError:
-            logger.warning("___grecaptcha_cfg clients not ready; continuing anyway")
-        time.sleep(2)
-
-    def _extract_g_token_from_page(self, page) -> tuple[str, list]:
-        logger.info("Requesting g_token (url=%s title=%s)", page.url, page.title())
-        token = page.evaluate(
-            f"""
-            () => new Promise((resolve, reject) => {{
-                const timer = setTimeout(
-                    () => reject(new Error('grecaptcha.execute timeout')),
-                    45000
-                );
-                try {{
-                    grecaptcha.ready(() => {{
-                        grecaptcha
-                            .execute('{config.RECAPTCHA_SITE_KEY}', {{ action: 'ticket_api' }})
-                            .then(t => {{
-                                clearTimeout(timer);
-                                resolve(t);
-                            }})
-                            .catch(err => {{
-                                clearTimeout(timer);
-                                reject(err);
-                            }});
-                    }});
-                }} catch (err) {{
-                    clearTimeout(timer);
-                    reject(err);
-                }}
-            }})
-            """
-        )
-        if not token or not isinstance(token, str):
-            raise AdyApiError("Received an empty g_token from reCAPTCHA")
-        cookies = page.context.cookies()
-        logger.info("Obtained g_token (%d chars), cookies=%d", len(token), len(cookies))
-        return token, cookies
-
-    def _launch_browser(self, playwright, browser_name: str, headless: bool):
-        if browser_name == "firefox":
-            return playwright.firefox.launch(headless=headless)
-        return playwright.chromium.launch(
-            headless=headless,
-            args=CHROMIUM_ARGS,
-            ignore_default_args=["--enable-automation"],
-        )
-
-    def _obtain_g_token_with_browser(self, browser_name: str, headless: bool) -> tuple[str, list]:
         playwright = None
         browser = None
         context = None
         page = None
+        token = None
+
         try:
-            logger.info(
-                "Launching %s (headless=%s) for g_token",
-                browser_name,
-                headless,
-            )
             playwright = sync_playwright().start()
-            browser = self._launch_browser(playwright, browser_name, headless)
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=CHROMIUM_ARGS,
+            )
             context = browser.new_context(
                 user_agent=SAFARI_USER_AGENT,
-                viewport={"width": 1280, "height": 720},
+                viewport={"width": 1440, "height": 900},
                 locale="en-US",
             )
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-            )
+            if cookie_seed:
+                context.add_cookies(cookie_seed)
+
             page = context.new_page()
             page.goto(
                 config.ADY_SEARCH_PAGE,
                 wait_until="domcontentloaded",
                 timeout=120_000,
             )
-            try:
-                page.wait_for_load_state("load", timeout=30_000)
-            except PlaywrightTimeoutError:
-                logger.debug("load state timeout ignored")
-            self._wait_for_search_page(page)
-            return self._extract_g_token_from_page(page)
+            page.wait_for_function(
+                "() => document.title.indexOf('Just a moment') === -1",
+                timeout=90_000,
+            )
+            page.wait_for_function(
+                "() => typeof grecaptcha !== 'undefined' && !!grecaptcha.execute",
+                timeout=60_000,
+            )
+            time.sleep(1)
+
+            logger.info("Requesting g_token (url=%s title=%s)", page.url, page.title())
+            token = page.evaluate(
+                f"""
+                () => new Promise((resolve, reject) => {{
+                    grecaptcha.ready(() => {{
+                        grecaptcha
+                            .execute('{config.RECAPTCHA_SITE_KEY}', {{ action: 'ticket_api' }})
+                            .then(resolve)
+                            .catch(reject);
+                    }});
+                }})
+                """
+            )
+        except PlaywrightTimeoutError as exc:
+            raise AdyApiError(f"Timed out while obtaining g_token: {exc}") from exc
+        except Exception as exc:
+            raise AdyApiError(f"Failed to obtain g_token: {exc}") from exc
         finally:
-            for closer, label in ((page, "page"), (context, "context"), (browser, "browser")):
+            for closer, label in (
+                (page, "page"),
+                (context, "context"),
+                (browser, "browser"),
+            ):
                 if closer is None:
                     continue
                 try:
@@ -264,34 +169,11 @@ class AdyApiClient:
                 except Exception as cleanup_exc:
                     logger.debug("Error stopping playwright: %s", cleanup_exc)
 
-    def obtain_g_token(self) -> tuple[str, list]:
-        """
-        Return (g_token, cookies).
+        if not token or not isinstance(token, str):
+            raise AdyApiError("Received an empty g_token")
 
-        Order:
-          1) CAPTCHA_API_KEY → 2Captcha (cookies=[])
-          2) Playwright chromium/firefox (HEADLESS=0 recommended with xvfb-run)
-        """
-        if os.getenv("CAPTCHA_API_KEY", "").strip():
-            token = self._solve_g_token_via_2captcha()
-            return token, []
-
-        headless = os.getenv("HEADLESS", "1") != "0"
-        browsers = [
-            b.strip()
-            for b in os.getenv("ADY_BROWSER", "chromium,firefox").split(",")
-            if b.strip()
-        ]
-        last_error: Optional[Exception] = None
-
-        for browser_name in browsers:
-            try:
-                return self._obtain_g_token_with_browser(browser_name, headless)
-            except Exception as exc:
-                last_error = exc
-                logger.warning("%s g_token failed: %s", browser_name, exc)
-
-        raise AdyApiError(f"Failed to obtain g_token: {last_error}")
+        logger.info("Obtained g_token (%d chars)", len(token))
+        return token
 
     def _trip_dates_payload(self, g_token: str) -> Dict[str, Any]:
         return {
@@ -305,11 +187,9 @@ class AdyApiClient:
         }
 
     def get_trip_dates(self) -> List[AvailableTrip]:
-        g_token, browser_cookies = self.obtain_g_token()
-        if browser_cookies:
-            self._transfer_browser_cookies_to_session(browser_cookies)
-        else:
-            self._bootstrap_session()
+        """Fetch available trip dates for the configured route."""
+        self._bootstrap_session()
+        g_token = self.obtain_g_token()
 
         response = self.session.post(
             config.ADY_TRIP_DATES_URL,

@@ -20,9 +20,7 @@ ADY_SEARCH_PAGE = f"{ADY_BASE_URL}/en/ticket-search-en"
 ADY_LOGIN_PAGE = f"{ADY_BASE_URL}/en/login"
 ADY_LOGIN_PAGE = f"{ADY_BASE_URL}/en/login"
 ADY_TRIP_DATES_URL = f"{ADY_BASE_URL}/ticket-api/get_trip_dates"
-RECAPTCHA_SITE_KEY = "6LecJSYtAAAAAMSGKGKhA72oiCfAWr8EoAUzEMgj"
+RECAPTCHA_SITE_KEY = "6LfpFmsbAAAAAKigEk1t8PTNaLcUuNMAd5WSF_uq"
 
 # Local persistence for notified dates
 NOTIFIED_DATES_FILE = os.getenv("NOTIFIED_DATES_FILE", "notified_dates.json")
-BOT_TOKEN = "8885037099:AAEpfZc_vEcevzl6u_BlVxzIssDeyiXp3xs"
-CHAT_ID = "8595785253"
