@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -21,22 +22,18 @@ SAFARI_USER_AGENT = (
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 )
 
-# Low-memory Chromium flags for small VPS (prevent OOM killer).
+# Low-memory Chromium flags for small VPS.
+# Do NOT use --single-process or --disable-web-resources — they break reCAPTCHA.
 CHROMIUM_ARGS = [
     "--disable-blink-features=AutomationControlled",
-    "--disable-web-resources",
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
     "--disable-extensions",
-    "--disable-background-networking",
-    "--disable-default-apps",
-    "--disable-sync",
-    "--disable-translate",
     "--mute-audio",
     "--no-first-run",
-    "--single-process",
-    "--js-flags=--max-old-space-size=128",
+    "--disable-default-apps",
+    "--js-flags=--max-old-space-size=192",
 ]
 
 
@@ -105,27 +102,41 @@ class AdyApiClient:
             "() => typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function'",
             timeout=90_000,
         )
-        time.sleep(1)
+        # reCAPTCHA v3 needs a short settle time before execute() returns.
+        time.sleep(3)
 
     def _extract_g_token_from_page(self, page) -> tuple[str, list]:
         """Extract g_token and page cookies from a ready page. Returns (token, cookies)."""
+        logger.info(
+            "Requesting g_token (url=%s title=%s)",
+            page.url,
+            page.title(),
+        )
         token = page.evaluate(
             f"""
             () => new Promise((resolve, reject) => {{
-                const timer = setTimeout(() => reject(new Error('grecaptcha.execute timeout')), 45000);
-                grecaptcha.ready(() => {{
-                    grecaptcha
-                        .execute('{config.RECAPTCHA_SITE_KEY}', {{ action: 'ticket_api' }})
-                        .then(t => {{
-                            clearTimeout(timer);
-                            window._g_token = t;
-                            resolve(t);
-                        }})
-                        .catch(err => {{
-                            clearTimeout(timer);
-                            reject(err);
-                        }});
-                }});
+                const timer = setTimeout(
+                    () => reject(new Error('grecaptcha.execute timeout')),
+                    60000
+                );
+                try {{
+                    grecaptcha.ready(() => {{
+                        grecaptcha
+                            .execute('{config.RECAPTCHA_SITE_KEY}', {{ action: 'ticket_api' }})
+                            .then(t => {{
+                                clearTimeout(timer);
+                                window._g_token = t;
+                                resolve(t);
+                            }})
+                            .catch(err => {{
+                                clearTimeout(timer);
+                                reject(err);
+                            }});
+                    }});
+                }} catch (err) {{
+                    clearTimeout(timer);
+                    reject(err);
+                }}
             }})
             """
         )
@@ -134,7 +145,7 @@ class AdyApiClient:
             raise AdyApiError("Received an empty g_token from reCAPTCHA")
 
         cookies = page.context.cookies()
-        logger.debug("Extracted g_token (%d chars) and %d cookies", len(token), len(cookies))
+        logger.info("Obtained g_token (%d chars), cookies=%d", len(token), len(cookies))
         return token, cookies
 
     def obtain_g_token(self) -> tuple[str, list]:
@@ -145,6 +156,9 @@ class AdyApiClient:
         to avoid OOM on small VPS. Each retry launches a fresh browser (no hard-refresh).
         """
         max_retries = 2
+        # Prefer headed+Xvfb on tiny VPS if HEADLESS=0 (cron can use xvfb-run).
+        headless = os.getenv("HEADLESS", "1") != "0"
+
         for attempt in range(max_retries):
             playwright = None
             browser = None
@@ -157,13 +171,17 @@ class AdyApiClient:
 
                 playwright = sync_playwright().start()
                 browser = playwright.chromium.launch(
-                    headless=True,
+                    headless=headless,
                     args=CHROMIUM_ARGS,
+                    ignore_default_args=["--enable-automation"],
                 )
                 context = browser.new_context(
                     user_agent=SAFARI_USER_AGENT,
-                    viewport={"width": 800, "height": 600},
+                    viewport={"width": 1280, "height": 720},
                     locale="en-US",
+                )
+                context.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
                 )
 
                 page = context.new_page()
@@ -172,7 +190,6 @@ class AdyApiClient:
                     wait_until="domcontentloaded",
                     timeout=120_000,
                 )
-                # Optional: wait for load, but don't fail if analytics keep connecting.
                 try:
                     page.wait_for_load_state("load", timeout=30_000)
                 except PlaywrightTimeoutError:
