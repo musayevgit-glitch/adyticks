@@ -1,0 +1,5 @@
+requests>=2.32.0
+schedule>=1.2.0
+python-telegram-bot>=21.0
+curl_cffi>=0.7.0
+playwright>=1.40.0

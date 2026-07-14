@@ -1,0 +1,9 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+notified_dates.json
+config.py
+.env
+ms-playwright/
+*.log
