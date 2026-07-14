@@ -21,6 +21,24 @@ SAFARI_USER_AGENT = (
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 )
 
+# Low-memory Chromium flags for small VPS (prevent OOM killer).
+CHROMIUM_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-web-resources",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--disable-translate",
+    "--mute-audio",
+    "--no-first-run",
+    "--single-process",
+    "--js-flags=--max-old-space-size=128",
+]
+
 
 @dataclass(frozen=True)
 class AvailableTrip:
@@ -51,7 +69,10 @@ class AdyApiClient:
                 domain=cookie_data.get("domain", ""),
                 path=cookie_data.get("path", "/"),
             )
-        logger.debug("Transferred cookies from browser to session: %s", [c["name"] for c in browser_cookies])
+        logger.debug(
+            "Transferred cookies from browser to session: %s",
+            [c["name"] for c in browser_cookies],
+        )
 
     def _build_api_headers(self) -> Dict[str, str]:
         xsrf_token = self.session.cookies.get("XSRF-TOKEN")
@@ -73,7 +94,6 @@ class AdyApiClient:
         # Allow reCAPTCHA and any late redirects to settle.
         time.sleep(10)
 
-        # Store the token in the window object to ensure it survives context destruction
         token = page.evaluate(
             f"""
             () => new Promise((resolve, reject) => {{
@@ -89,18 +109,16 @@ class AdyApiClient:
             }})
             """
         )
-        
-        # Verify token was captured
+
         if token:
             verify_token = page.evaluate("() => window._g_token")
             if verify_token != token:
                 logger.warning("Token mismatch detected, using window value")
                 token = verify_token
-        
+
         if not token or not isinstance(token, str):
             raise AdyApiError("Received an empty g_token from reCAPTCHA")
-        
-        # Get cookies from the page context
+
         cookies = page.context.cookies()
         logger.debug("Extracted g_token (%d chars) and %d cookies", len(token), len(cookies))
         return token, cookies
@@ -109,36 +127,51 @@ class AdyApiClient:
         """
         Execute Google reCAPTCHA v3 in a headless browser context with retry logic.
 
-        Returns (g_token, cookies) where cookies are from the browser context.
-        If extraction fails, the page is hard-refreshed and reattempted once.
+        Returns (g_token, cookies). Playwright resources are always closed in finally
+        to avoid OOM on small VPS.
         """
         max_retries = 2
         for attempt in range(max_retries):
-            token = None
-            cookies = []
+            playwright = None
+            browser = None
+            context = None
+            page = None
             try:
-                with sync_playwright() as playwright:
-                    browser = playwright.chromium.launch(
-                        headless=True,
-                        args=[
-                            "--disable-blink-features=AutomationControlled",
-                            "--disable-web-resources",
-                        ],
-                    )
-                    context = browser.new_context(
-                        user_agent=SAFARI_USER_AGENT,
-                        viewport={"width": 1440, "height": 900},
-                        locale="en-US",
-                    )
+                playwright = sync_playwright().start()
+                browser = playwright.chromium.launch(
+                    headless=True,
+                    args=CHROMIUM_ARGS,
+                )
+                context = browser.new_context(
+                    user_agent=SAFARI_USER_AGENT,
+                    viewport={"width": 800, "height": 600},
+                    locale="en-US",
+                )
 
-                    page = context.new_page()
-                    page.on("close", lambda: logger.debug("Page closed"))
-                    
-                    page.goto(
-                        config.ADY_SEARCH_PAGE,
-                        wait_until="domcontentloaded",
-                        timeout=120_000,
+                page = context.new_page()
+                page.on("close", lambda: logger.debug("Page closed"))
+
+                page.goto(
+                    config.ADY_SEARCH_PAGE,
+                    wait_until="domcontentloaded",
+                    timeout=120_000,
+                )
+                page.wait_for_load_state("networkidle", timeout=90_000)
+                page.wait_for_function(
+                    "() => document.title.indexOf('Just a moment') === -1",
+                    timeout=90_000,
+                )
+                page.wait_for_function(
+                    "() => typeof grecaptcha !== 'undefined' && !!grecaptcha.execute",
+                    timeout=60_000,
+                )
+
+                if attempt > 0:
+                    logger.info(
+                        "Hard-refreshing page after g_token extraction failure (attempt %d)",
+                        attempt + 1,
                     )
+                    page.keyboard.press("Control+Shift+R")
                     page.wait_for_load_state("networkidle", timeout=90_000)
                     page.wait_for_function(
                         "() => document.title.indexOf('Just a moment') === -1",
@@ -148,41 +181,46 @@ class AdyApiClient:
                         "() => typeof grecaptcha !== 'undefined' && !!grecaptcha.execute",
                         timeout=60_000,
                     )
-                    
-                    # Hard refresh on retry
-                    if attempt > 0:
-                        logger.info("Hard-refreshing page after g_token extraction failure (attempt %d)", attempt + 1)
-                        page.keyboard.press("Control+Shift+R")
-                        page.wait_for_load_state("networkidle", timeout=90_000)
-                        page.wait_for_function(
-                            "() => document.title.indexOf('Just a moment') === -1",
-                            timeout=90_000,
-                        )
-                        page.wait_for_function(
-                            "() => typeof grecaptcha !== 'undefined' && !!grecaptcha.execute",
-                            timeout=60_000,
-                        )
-                    
-                    token, cookies = self._extract_g_token_from_page(page)
-                    
-                    page.close()
-                    context.close()
-                    browser.close()
-                    
-                    return token, cookies
+
+                return self._extract_g_token_from_page(page)
             except (PlaywrightTimeoutError, AdyApiError) as exc:
                 if attempt < max_retries - 1:
-                    logger.warning("g_token extraction failed on attempt %d, will retry: %s", attempt + 1, exc)
+                    logger.warning(
+                        "g_token extraction failed on attempt %d, will retry: %s",
+                        attempt + 1,
+                        exc,
+                    )
                 else:
                     if isinstance(exc, PlaywrightTimeoutError):
                         raise AdyApiError(f"Timed out while obtaining g_token: {exc}") from exc
-                    else:
-                        raise exc
+                    raise
             except Exception as exc:
                 if attempt < max_retries - 1:
-                    logger.warning("g_token extraction failed on attempt %d, will retry: %s", attempt + 1, exc)
+                    logger.warning(
+                        "g_token extraction failed on attempt %d, will retry: %s",
+                        attempt + 1,
+                        exc,
+                    )
                 else:
                     raise AdyApiError(f"Failed to obtain g_token: {exc}") from exc
+            finally:
+                for closer, label in (
+                    (page, "page"),
+                    (context, "context"),
+                    (browser, "browser"),
+                ):
+                    if closer is None:
+                        continue
+                    try:
+                        closer.close()
+                    except Exception as cleanup_exc:
+                        logger.debug("Error closing %s: %s", label, cleanup_exc)
+
+                if playwright is not None:
+                    try:
+                        playwright.stop()
+                    except Exception as cleanup_exc:
+                        logger.debug("Error stopping playwright: %s", cleanup_exc)
 
         raise AdyApiError("Failed to obtain g_token after all retries")
 
@@ -203,7 +241,6 @@ class AdyApiClient:
 
         Returns an empty list when no tickets are available.
         """
-        # Get g_token from browser and use its cookies to initialize session
         g_token, browser_cookies = self.obtain_g_token()
         self._transfer_browser_cookies_to_session(browser_cookies)
 
@@ -241,11 +278,9 @@ class AdyApiClient:
         trips: List[AvailableTrip] = []
 
         if isinstance(raw_data, dict):
-            # Example: {"1": [{"trip_date": "...", ...}]}
             for value in raw_data.values():
                 trips.extend(AdyApiClient._extract_trips_from_group(value))
         elif isinstance(raw_data, list):
-            # Example: [[{"trip_date": "...", ...}]]
             for group in raw_data:
                 trips.extend(AdyApiClient._extract_trips_from_group(group))
         else:

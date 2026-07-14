@@ -7,3 +7,10 @@ config.py
 .env
 ms-playwright/
 *.log
+*.bak
+*.bak.*
+.tmp_remote/
+lean_server_push.sh
+server_push_to_github.sh
+fix_oom.sh
+fix_oom_remote.sh

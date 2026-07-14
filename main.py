@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import sys
 import time
@@ -103,21 +104,20 @@ def check_tickets(
 
 
 def run_once() -> None:
-    """Run a single availability check (used by GitHub Actions)."""
+    """Run a single availability check (used by GitHub Actions / cron)."""
     validate_config()
 
     api_client = AdyApiClient()
     storage = NotifiedDatesStorage()
     notifier = TelegramNotifier()
-    check_tickets(api_client, storage, notifier)
+    try:
+        check_tickets(api_client, storage, notifier)
+    finally:
+        gc.collect()
 
 
 def run_forever() -> None:
     validate_config()
-
-    api_client = AdyApiClient()
-    storage = NotifiedDatesStorage()
-    notifier = TelegramNotifier()
 
     logger.info(
         "Starting ADY monitor: %s → %s (every %s seconds)",
@@ -126,14 +126,18 @@ def run_forever() -> None:
         config.CHECK_INTERVAL,
     )
 
-    # Run immediately on startup, then on schedule.
-    check_tickets(api_client, storage, notifier)
-    schedule.every(config.CHECK_INTERVAL).seconds.do(
-        check_tickets,
-        api_client=api_client,
-        storage=storage,
-        notifier=notifier,
-    )
+    def scheduled_check() -> None:
+        # Fresh client each run so Playwright/session objects are not retained.
+        api_client = AdyApiClient()
+        storage = NotifiedDatesStorage()
+        notifier = TelegramNotifier()
+        try:
+            check_tickets(api_client, storage, notifier)
+        finally:
+            gc.collect()
+
+    scheduled_check()
+    schedule.every(config.CHECK_INTERVAL).seconds.do(scheduled_check)
 
     while True:
         try:
@@ -148,7 +152,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Run one check and exit (for GitHub Actions cron)",
+        help="Run one check and exit (for GitHub Actions / cron)",
     )
     return parser.parse_args()
 
