@@ -5,6 +5,10 @@ import os
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
+# Birdən çox alıcı: EXTRA_CHAT_IDS="111,222" kimi set et
+_extra = [c.strip() for c in os.getenv("EXTRA_CHAT_IDS", "").split(",") if c.strip()]
+CHAT_IDS: list[str] = list(dict.fromkeys([CHAT_ID] + _extra))
+
 # Check interval in seconds (600 = 10 minutes)
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))
 
